@@ -1,6 +1,14 @@
 importScripts("https://www.gstatic.com/firebasejs/12.3.0/firebase-app-compat.js");
 importScripts("https://www.gstatic.com/firebasejs/12.3.0/firebase-messaging-compat.js");
 
+/* Dieser eine Service Worker erledigt zwei Aufgaben (pro Scope ist nur einer möglich):
+   1. Firebase-Push anzeigen und beim Klick die richtige Seite öffnen
+   2. App-Hülle für Offline-Start cachen, aber immer zuerst das Netz fragen,
+      damit nach einem Update nie veraltete Dateien ausgeliefert werden. */
+
+const CACHE = "playerhub-shell-v2";
+const SHELL = ["./", "index.html", "manifest.json", "icon-192.png", "icon-512.png"];
+
 firebase.initializeApp({
   apiKey: "AIzaSyDc9AIpeiloHQplOlh7tpkdLCQlX8siQgA",
   authDomain: "playerhub-3b588.firebaseapp.com",
@@ -12,53 +20,83 @@ firebase.initializeApp({
 
 const messaging = firebase.messaging();
 
+// Der Server sendet reine Daten-Nachrichten (ohne "notification"-Feld),
+// deshalb zeigt ausschließlich dieser Handler die Meldung an – keine Duplikate.
 messaging.onBackgroundMessage((payload) => {
-  console.log("PlayerHub Push:", payload);
+  const d = payload.data || {};
+  const title = d.title || payload.notification?.title || "PlayerHub";
 
-  const title =
-    payload.notification?.title ||
-    payload.data?.title ||
-    "PlayerHub";
-
-  const options = {
-    body:
-      payload.notification?.body ||
-      payload.data?.body ||
-      "Es gibt etwas Neues bei PlayerHub.",
-    icon: "/PlayerHub/icon-192.png",
-    badge: "/PlayerHub/icon-192.png",
-    data: {
-      url:
-        payload.data?.url ||
-        "https://maximilianheinze597-cloud.github.io/PlayerHub/"
-    }
-  };
-
-  self.registration.showNotification(title, options);
+  return self.registration.showNotification(title, {
+    body: d.body || payload.notification?.body || "Es gibt etwas Neues bei PlayerHub.",
+    icon: "icon-192.png",
+    badge: "icon-192.png",
+    tag: d.type ? `playerhub-${d.type}` : undefined,
+    data: { url: d.url || self.registration.scope }
+  });
 });
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
 
-  const url =
-    event.notification.data?.url ||
-    "https://maximilianheinze597-cloud.github.io/PlayerHub/";
+  let target = self.registration.scope;
+  try {
+    const u = new URL(event.notification.data?.url || target, self.registration.scope);
+    if (u.origin === self.location.origin) target = u.toString();
+  } catch (e) { /* ungültige URL: Startseite öffnen */ }
 
   event.waitUntil(
-    clients.matchAll({
-      type: "window",
-      includeUncontrolled: true
-    }).then((clientList) => {
-      for (const client of clientList) {
-        if ("focus" in client) {
-          client.navigate(url);
+    clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (list) => {
+      for (const client of list) {
+        if (client.url.startsWith(self.registration.scope) && "focus" in client) {
+          try { await client.navigate(target); } catch (e) { /* ignorieren */ }
           return client.focus();
         }
       }
-
-      if (clients.openWindow) {
-        return clients.openWindow(url);
-      }
+      return clients.openWindow ? clients.openWindow(target) : undefined;
     })
+  );
+});
+
+self.addEventListener("install", (event) => {
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((cache) => Promise.allSettled(SHELL.map((f) => cache.add(f))))
+      .then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(
+        keys.filter((k) => k.startsWith("playerhub-shell-") && k !== CACHE)
+            .map((k) => caches.delete(k))
+      ))
+      .then(() => self.clients.claim())
+  );
+});
+
+// Netz zuerst, Cache nur als Offline-Fallback. Nur eigene Dateien (GET):
+// Supabase- und Firebase-Anfragen laufen unverändert am Cache vorbei.
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+
+  event.respondWith(
+    fetch(req)
+      .then((res) => {
+        if (res && res.status === 200 && res.type === "basic") {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy));
+        }
+        return res;
+      })
+      .catch(() =>
+        caches.match(req).then((hit) =>
+          hit || (req.mode === "navigate" ? caches.match("index.html") : undefined)
+        )
+      )
   );
 });
