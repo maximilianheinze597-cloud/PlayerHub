@@ -305,6 +305,18 @@ end $$;
 revoke all on function public.save_push_subscription(text, text) from public;
 grant execute on function public.save_push_subscription(text, text) to authenticated;
 
+do $$
+declare r record;
+begin
+  for r in
+    select p.oid::regprocedure as sig
+    from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'remove_push_subscription'
+  loop
+    execute 'drop function ' || r.sig;
+  end loop;
+end $$;
+
 create function public.remove_push_subscription(p_token text)
 returns void
 language sql
